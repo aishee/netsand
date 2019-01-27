@@ -1,0 +1,319 @@
+#!/bin/sh
+
+OGLOB=`set +o | grep glob`
+set -f
+
+_abs_dirname() {
+  (cd `dirname $1` && pwd)
+}
+
+EXT=".so.1"
+P="`_abs_dirname $0`/"
+F=`echo ${P} | sed -e 's#/bin/$#/lib/#'`
+
+case "${P}" in
+  /usr/bin/)
+    P=""
+    ;;
+  */bin/)
+    p="$F"
+    ;;
+esac
+
+LIB="${P}libnet-sand${EXT}"
+FLIB="${P}libnet-sand${EXT}"
+
+_warn() {
+  cat >&2 <<EOF
+sand: $*
+EOF
+}
+_die() {
+  _warn $*
+  exit 1
+}
+_version() {
+  V=`string "$FLIB" 2>/dev/null | grep 'netsand v' | uniq`
+  if test "a$V" = "a"; then
+    unset V
+    _die "couldn't find netsand version in $FLIB!"
+  else
+    echo $V
+    unset V
+  fi
+}
+
+_help() {
+  cat <<EOF
+Network SandBox - By Aishee Nguyen - BreakTeam
+Usage: sand [OPTION]... [--] COMMAND [ARGS]
+Prevent connections to blocked addresses in COMMAND.
+If no COMMAND is specified but some addresses are configured to be allowed or
+blocked, then shell snippets to set the chosen configuration are displayed.
+
+OPTIONS:
+ -d, --allow-dns                  	Allow connections to DNS nameservers.
+ -a, --allow=ADDRESS[/BITS][:PORT]	Allow connections to ADDRESS[/BITS][:PORT].
+ -b, --block=ADDRESS[/BITS][:PORT]	Prevent connections to ADDRESS[/BITS][:PORT]. BITS is the number of bits in CIDR notation prefix. When BITS is specified, the rule matches the IP range.
+ -h, --help                       	Print this help message.
+ -t, --log-target=LOG             	Where to log. LOG is a comma-separated list that can contain the following values:
+                                  	  - stderr	This is the default
+                                  	  - syslog	Write to syslog
+                                  	  - file	Write to COMMAND.sand file
+ -p, --log-path=PATH              	Path for file log.
+ -l, --log-level=LEVEL            	What to log. LEVEL can contain one of the following values:
+                                  	  - silent	Do not log anything
+                                  	  - error	Log errors
+                                  	  - block	Log errors and blocked connections
+                                  	  - allow	Log errors, blocked and allowed connections
+                                  	  - debug	Log everything
+ -v, --version                    	Print netsand version.
+EOF
+}
+
+_value() {
+  echo "$1" | cut -d= -f2
+}
+
+_ensure_arg() {
+  if test "a$2" = "a"; then
+    _die "missing value for \`$1' argument!"
+  fi
+}
+
+_print_def() {
+  if eval test "a\$$1" != "a"; then
+    eval "echo $1=\'\$$1\'"
+    echo "export $1"
+  fi
+}
+
+_append_env_var() {
+  _ensure_arg "$2" "$3"
+  eval $1="\$$1#$3"
+}
+
+_append_preload() {
+  case `uname -s` in
+    Darwin)
+      preload=DYLD_INSERT_LIBRARIES
+      export DYLD_FORCE_FLAT_NAMESPACE=1
+      ;;
+
+    *)
+      preload=LD_PRELOAD
+      ;;
+  esac
+
+  if eval test "a\$$preload" != "a"; then
+    eval $preload="$LIB:\$$preload"
+  else
+    eval $preload="$LIB"
+  fi
+  export $preload
+}
+
+# Solaris /bin/sh does not understand bitwise operations
+# so we rely on tcsh there
+_bitwise_or() {
+  case `uname -s` in
+    SunOS)
+      echo "@ a = $1; @ b = $2; @ x = (\$a | \$b); echo \$x" | tcsh -s
+      ;;
+    *)
+      echo "$(($1|$2))"
+      ;;
+  esac
+}
+
+_append_log_target() {
+  _ensure_arg "$1" "$2"
+  OIFS=$IFS
+  IFS=','
+  for target in $2; do
+    case $target in
+      stderr)
+        SAND_LOG_TARGET=`_bitwise_or ${SAND_LOG_TARGET} 1`
+        ;;
+      syslog)
+        SAND_LOG_TARGET=`_bitwise_or ${SAND_LOG_TARGET} 2`
+        ;;
+      file)
+        SAND_LOG_TARGET=`_bitwise_or ${SAND_LOG_TARGET} 4`
+        ;;
+      *)
+        _die "unknown log target \`$target'!"
+        ;;
+    esac
+  done
+  IFS=$OIFS
+
+  # local variables are not portable, so unset them manually
+  unset target
+  unset OIFS
+}
+
+_set_log_path() {
+  _ensure_arg "$1" "$2"
+  if test -d "$2"; then
+    SAND_LOG_PATH="$2"
+  else
+    _die "no such directory \`$2'!"
+  fi
+}
+
+_set_log_level() {
+  _ensure_arg "$1" "$2"
+  case "$2" in
+    silent)
+      SAND_LOG_LEVEL=0
+      ;;
+    error)
+      SAND_LOG_LEVEL=1
+      ;;
+    block)
+      SAND_LOG_LEVEL=2
+      ;;
+    allow)
+      SAND_LOG_LEVEL=3
+      ;;
+    debug)
+      SAND_LOG_LEVEL=4
+      ;;
+    *)
+      _die "unknown log level \`$2'!"
+      ;;
+  esac
+}
+
+if test "a$SAND_LOG_TARGET" = "a"; then
+  SAND_LOG_TARGET=1
+fi
+
+while test $# -gt 0; do
+  case "$1" in
+    -h|--help)
+      _help
+      exit 0
+      ;;
+
+    -v|--version)
+      _version
+      exit 0
+      ;;
+
+    -d|--allow-dns)
+      for n in `grep '^nameserver ' /etc/resolv.conf | cut -d' ' -f2`; do
+        _append_env_var SAND_ALLOW "$1" "$n:53"
+      done
+      unset n
+      shift
+      ;;
+
+    -a)
+      _append_env_var SAND_ALLOW "$1" "$2"
+      shift 2
+      ;;
+
+    --allow=*)
+      _append_env_var SAND_ALLOW "$1" "`_value $1`"
+      shift
+      ;;
+
+    -b)
+      _append_env_var SAND_BLOCK "$1" "$2"
+      shift 2
+      ;;
+
+    --block=*)
+      _append_env_var SAND_BLOCK "$1" "`_value $1`"
+      shift
+      ;;
+
+    -t)
+      _append_log_target "$1" "$2"
+      shift 2
+      ;;
+
+    --log-target=*)
+      _append_log_target "$1" "`_value $1`"
+      shift
+      ;;
+
+    -p)
+      _set_log_path "$1" "$2"
+      shift 2
+      ;;
+
+    --log-path=*)
+      _set_log_path "$1" "`_value $1`"
+      shift
+      ;;
+
+    -l)
+      _set_log_level "$1" "$2"
+      shift 2
+      ;;
+
+    --log-level=*)
+      _set_log_level "$1" "`_value $1`"
+      shift
+      ;;
+
+    --)
+      shift
+      break
+      ;;
+
+    -*)
+      _die "unknown \`$1' argument!"
+      ;;
+
+    *)
+      break
+      ;;
+
+  esac
+done
+
+if test "a$SAND_ALLOW" != "a"; then
+  SAND_ALLOW="`echo $SAND_ALLOW | sed -e 's/^#//' -e 's/#/;/g'`"
+fi
+export SAND_ALLOW
+
+if test "a$SAND_BLOCK" != "a"; then
+  SAND_BLOCK="`echo $SAND_BLOCK | sed -e 's/^#//' -e 's/#/;/g'`"
+fi
+export SAND_BLOCK
+
+if test $# -eq 0; then
+  if test \( "a$SAND_ALLOW" != "a" \) -o \( "a$SAND_BLOCK" != "a" \); then
+    for v in SAND_ALLOW SAND_BLOCK SAND_LOG_TARGET SAND_LOG_LEVEL SAND_LOG_PATH; do
+      _print_def "$v"
+    done
+    _append_preload
+    _print_def "$preload"
+    exit 0
+  else
+    _warn "missing command!"
+    _help >&2
+    exit 1
+  fi
+fi
+
+unset EXT
+unset P
+unset F
+
+export SAND_LOG_TARGET
+export SAND_LOG_LEVEL
+export SAND_LOG_PATH
+
+_append_preload
+unset preload
+unset LIB
+unset FLIB
+
+eval $OGLOB
+unset OGLOB
+exec "$@"
